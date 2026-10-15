@@ -1,0 +1,21 @@
+// omadown - Waybar custom module
+//
+// Merge this into ~/.config/waybar/config.jsonc (Omarchy keeps its own copy under
+// ~/.config/omarchy/... , so add the module to whichever file your setup sources).
+//
+// Requires the script installed by install.sh at ~/.local/bin/omadown-waybar.
+
+{
+  "custom/omadown": {
+    "exec": "omadown-waybar --compact",
+    "return-type": "json",
+    "interval": 1,
+    "tooltip": true,
+    "hide-empty-text": true,
+    "on-click": "omadown-tui",
+    "on-click-right": "omadown cancel && omadown-waybar",
+    "on-click-middle": "omadown retry",
+    "format": "{}",
+    "signal": 8
+  }
+}

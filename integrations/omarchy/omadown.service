@@ -1,0 +1,32 @@
+[Unit]
+Description=omadown download queue daemon (queue, clipboard watch, control socket)
+Documentation=file:%h/.local/share/omadown/lib/omadown/README.md
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omadown daemon
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+# A downloader needs its own process group so `omadown cancel` can kill ffmpeg
+# and yt-dlp children cleanly.
+KillMode=mixed
+Environment=PYTHONUNBUFFERED=1
+
+# Modest hardening: it writes only to the download folder, the XDG dirs and /tmp.
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=%h/Videos %h/Downloads %h/Media %h/.local/share/omadown %h/.config/omadown
+Nice=5
+
+Slice=session.slice
+MemoryMax=1G
+
+[Install]
+WantedBy=graphical-session.target

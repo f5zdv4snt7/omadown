@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Add link to omadown
+GenericName=Queue Downloader
+Comment=把链接加入 omadown 队列
+Exec=omadown add %u -f
+Icon=folder-download
+Terminal=true
+StartupNotify=false
+Categories=AudioVideo;Network;FileTransfer;
+MimeType=x-scheme-handler/omadown;

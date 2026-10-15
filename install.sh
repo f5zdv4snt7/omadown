@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# omadown installer for Omarchy (Arch + Hyprland).
+#
+#   ./install.sh                 install everything
+#   ./install.sh --no-deps       skip package installation
+#   ./install.sh --no-integrations
+#   ./install.sh --uninstall
+#
+# Design notes:
+#   * Python code is copied to ~/.local/share/omadown/lib and launched through a
+#     wrapper in ~/.local/bin. We never touch pip: Arch marks Python as
+#     externally-managed, and a download tool should not fight the package manager.
+#   * Omarchy integration files are written to ~/.config/omarchy/extensions/ so the
+#     distribution's own defaults are left untouched.
+#
+# ---------------------------------------------------------------------------
+# HYPRLAND CONFIG IS LUA NOW -- DO NOT WRITE .conf FILES
+#
+# Omarchy migrated ~/.config/hypr/ from plain Hyprland config (hyprland.conf +
+# source <file>.conf) to Lua modules (hyprland.lua + require("hypr.*")). The
+# ~/.config/omarchy/extensions/ directory is NOT part of the Hyprland config
+# chain any more -- it holds menu .jsonc files and .sh hooks only, and nothing
+# sources *.conf from it. An omadown.conf dropped there is silently ignored,
+# which is why "Super+D does nothing" was the bug.
+#
+# So this installer installs integrations/omarchy/omadown.lua and wires it in via
+# ~/.config/hypr/hyprland.lua. It supports BOTH Omarchy generations:
+#   * Lua configs   -> `require("hypr.omadown")` (or dofile fallback)
+#   * legacy .conf  -> `source = ~/.config/omadown/omadown.conf` (generated)
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omadown"
+BIN_DIR="$HOME/.local/bin"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omadown"
+OMARCHY_EXT="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/extensions"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+HYPR_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hypr"
+
+DEPS=(yt-dlp ffmpeg wl-clipboard libnotify python)
+WITH_DEPS=1
+WITH_INTEGRATIONS=1
+ACTION="install"
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-deps)          WITH_DEPS=0 ;;
+    --no-integrations)  WITH_INTEGRATIONS=0 ;;
+    --uninstall)        ACTION="uninstall" ;;
+    -h|--help)          sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+log()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[!]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --------------------------------------------------------------------- uninstall
+if [ "$ACTION" = "uninstall" ]; then
+  log "停止并禁用守护进程"
+  systemctl --user disable --now omadown.service 2>/dev/null || true
+
+  log "移除文件"
+  rm -f "$BIN_DIR/omadown" "$BIN_DIR/omadown-waybar" "$BIN_DIR/omadown-tui" \
+        "$BIN_DIR/omadown-menu" "$BIN_DIR/omadown-notify-status" \
+        "$BIN_DIR/omadown-clipboard-add"
+  rm -f "$OMARCHY_EXT/omadown.lua" "$OMARCHY_EXT/omadown-menu.sh"
+  rm -f "$SYSTEMD_DIR/omadown.service"
+  rm -f "$DESKTOP_DIR/omadown.desktop" "$DESKTOP_DIR/omadown-add.desktop"
+  rm -f "$CFG_DIR/omadown.conf"
+  rm -rf "$LIB_DIR"
+
+  # Drop the loader line we appended to hyprland.lua, and remove the Lua module
+  # if it was installed under ~/.config/hypr/.
+  if [ -f "$HYPR_DIR/hyprland.lua" ]; then
+    hypr_remove_loader_line
+  fi
+  rm -f "$HYPR_DIR/omadown.lua"
+
+  # Legacy installs put a dead .conf in the extensions dir -- clean that up too.
+  rm -f "$OMARCHY_EXT/omadown.conf"
+
+  # Remove the keybindings that an earlier version of this installer may have
+  # asked the user to paste into ~/.config/hypr/bindings.lua by hand.
+  hypr_remove_pasted_block
+
+  systemctl --user daemon-reload 2>/dev/null || true
+  log "已卸载。配置与下载记录保留在 $CFG_DIR 与 \${XDG_DATA_HOME:-~/.local/share}/omadown"
+  exit 0
+fi
+
+# ------------------------------------------------------------------------ checks
+command -v python3 >/dev/null 2>&1 || die "缺少 python3"
+PYVER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
+  || die "需要 Python 3.11+（当前 $PYVER）。tomllib 依赖 3.11。"
+log "Python $PYVER"
+
+if [ "$WITH_DEPS" = 1 ]; then
+  if command -v omarchy-pkg-install >/dev/null 2>&1; then
+    log "通过 omarchy-pkg-install 安装依赖: ${DEPS[*]}"
+    omarchy-pkg-install "${DEPS[@]}"
+  else
+    warn "未找到 omarchy-pkg-install（不是在 Omarchy 上？）"
+    warn "请手动安装: pacman -S ${DEPS[*]}"
+  fi
+fi
+
+# ------------------------------------------------------------------- python side
+log "安装 Python 包到 $LIB_DIR"
+mkdir -p "$LIB_DIR" "$BIN_DIR"
+rm -rf "$LIB_DIR/omadown" "$LIB_DIR/omadown.py"
+cp -r "$SRC_DIR/omadown" "$LIB_DIR/omadown"
+find "$LIB_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+write_wrapper() {
+  local name="$1"
+  cat > "$BIN_DIR/$name" <<EOF
+#!/bin/sh
+# generated by omadown install.sh
+PYTHONPATH="$LIB_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m omadown "\$@"
+EOF
+  chmod +x "$BIN_DIR/$name"
+}
+
+write_wrapper omadown
+
+cat > "$BIN_DIR/omadown-waybar" <<EOF
+#!/bin/sh
+exec "$BIN_DIR/omadown" status --waybar "\$@"
+EOF
+chmod +x "$BIN_DIR/omadown-waybar"
+
+cat > "$BIN_DIR/omadown-notify-status" <<'EOF'
+#!/bin/sh
+# Show the queue summary as a desktop notification.
+summary="$(omadown status 2>/dev/null | tail -1)"
+if command -v notify-send >/dev/null 2>&1; then
+  notify-send -a omadown -i folder-download "omadown" "${summary:-队列为空}"
+else
+  printf '%s\n' "${summary:-队列为空}"
+fi
+EOF
+chmod +x "$BIN_DIR/omadown-notify-status"
+
+cat > "$BIN_DIR/omadown-clipboard-add" <<'EOF'
+#!/bin/sh
+# Feed the current clipboard into the queue (daemon picks it up if it is running).
+exec omadown paste --force
+EOF
+chmod +x "$BIN_DIR/omadown-clipboard-add"
+
+# ------------------------------------------------------- hyprland config wiring
+# Everything below is about making the keybindings actually register. There are
+# three generations of Omarchy to cope with, and the install must not silently
+# do nothing on any of them:
+#
+#   A. Lua config (current)      hyprland.lua + require("hypr.*")
+#   B. Lua config, no bootstrap  hyprland.lua that does not set up package.path
+#   C. legacy plain config       hyprland.conf + source <file>.conf
+#
+# Detect which one we have and wire accordingly. Never write into a .conf file in
+# the extensions dir: nothing loads those any more.
+
+# Remove a previously-appended loader line, so re-running the installer is
+# idempotent instead of stacking duplicates.
+#
+# The installer appends exactly two lines to the END of hyprland.lua:
+#     -- omadown: keybindings and window rules
+#     require("hypr.omadown")
+# so removal is a whole-block match on the tail, not a per-line filter. A
+# per-line filter can't tell "our loader line" from a user line that happens to
+# mention omadown, and it also cannot safely drop the preceding comment.
+hypr_remove_loader_line() {
+  [ -f "$HYPR_DIR/hyprland.lua" ] || return 0
+  python3 - "$HYPR_DIR/hyprland.lua" <<'PY'
+import os
+import re
+import sys
+import tempfile
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    text = fh.read()
+
+# An appended block: optional leading blank lines, the banner comment, then one
+# loader line. Anchored to the end of the file so only what we appended is
+# removed and nothing the user wrote earlier is touched.
+block = re.compile(
+    r"(?:\n)*"
+    r"--\s*omadown:.*\n"
+    r"(?:require\(\"hypr\.omadown\"\)"
+    r"|dofile\(.*omadown\.lua\")\)?"
+    r"\s*\n*\Z"
+)
+new = block.sub("\n", text)
+if new != text:
+    with tempfile.NamedTemporaryFile(
+        "w", dir=os.path.dirname(path), delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(new)
+        tmp = tf.name
+    os.replace(tmp, path)
+    print("removed omadown loader block from " + path)
+PY
+}
+
+# Strip a bindings block that an older version of the installer told the user to
+# paste into ~/.config/hypr/bindings.lua by hand.
+hypr_remove_pasted_block() {
+  [ -f "$HYPR_DIR/bindings.lua" ] || return 0
+  python3 - "$HYPR_DIR/bindings.lua" <<'PY'
+import sys, os, re, tempfile
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+# The pasted block always starts with this banner comment.
+pattern = re.compile(
+    r"\n-- =+\n-- omadown.*?\n(?:-- =+\n)?.*?(?=\n-- =+\n-- (?:FIX|Personal|Logitech)|\Z)",
+    re.S,
+)
+new = pattern.sub("\n", text)
+if new != text:
+    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path),
+                                     delete=False, encoding="utf-8") as tf:
+        tf.write(new)
+        tmp = tf.name
+    os.replace(tmp, path)
+PY
+}
+
+if [ "$WITH_INTEGRATIONS" = 1 ]; then
+  log "安装 Omarchy 集成"
+  mkdir -p "$BIN_DIR" "$CFG_DIR" "$OMARCHY_EXT" "$SYSTEMD_DIR" "$DESKTOP_DIR"
+  install -Dm755 "$SRC_DIR/integrations/omarchy/omadown-tui.sh" "$BIN_DIR/omadown-tui"
+  install -Dm755 "$SRC_DIR/integrations/omarchy/omadown-menu.sh" "$BIN_DIR/omadown-menu"
+  install -Dm644 "$SRC_DIR/integrations/omarchy/omadown-menu.sh" "$OMARCHY_EXT/omadown-menu.sh"
+  install -Dm644 "$SRC_DIR/integrations/omarchy/omadown.desktop" "$DESKTOP_DIR/omadown.desktop"
+  install -Dm644 "$SRC_DIR/integrations/omarchy/omadown-add.desktop" "$DESKTOP_DIR/omadown-add.desktop"
+  install -Dm644 "$SRC_DIR/integrations/omarchy/omadown.service" "$SYSTEMD_DIR/omadown.service"
+  install -Dm644 "$SRC_DIR/integrations/omarchy/waybar-module.jsonc" "$CFG_DIR/waybar-module.jsonc"
+
+  # Retire the legacy .conf: it never loaded, and leaving it around invites
+  # someone to "fix" the keybinding by editing a dead file.
+  if [ -f "$OMARCHY_EXT/omadown.conf" ]; then
+    warn "移除旧的 ~/.config/omarchy/extensions/omadown.conf（新版 Omarchy 不加载 .conf，绑定全部失效）"
+    rm -f "$OMARCHY_EXT/omadown.conf"
+  fi
+
+  # --- wire the keybindings into the Hyprland config -------------------------
+  if [ -f "$HYPR_DIR/hyprland.conf" ] && [ ! -f "$HYPR_DIR/hyprland.lua" ]; then
+    # (C) legacy plain config: source a generated .conf.
+    log "检测到旧版 hyprland.conf，写入 $CFG_DIR/omadown.conf 并 source"
+    mkdir -p "$CFG_DIR"
+    cat > "$CFG_DIR/omadown.conf" <<'CONF'
+# omadown: generated by install.sh for a legacy (non-Lua) Hyprland config.
+$omadownTui = omadown-tui
+$omadownClip = omadown-clipboard-add
+
+bindd = SUPER, D, omadown 队列, exec, $omadownTui
+bindd = SUPER SHIFT, D, 下载剪贴板链接, exec, $omadownClip
+bindd = SUPER ALT, D, omadown 状态, exec, omadown-notify-status
+
+windowrule = float, match:class:^(omadown)$
+windowrule = size 1000 640, match:class:^(omadown)$
+windowrule = center, match:class:^(omadown)$
+windowrule = float, match:class:^(org\.omarchy\.omadown)$
+windowrule = size 1000 640, match:class:^(org\.omarchy\.omadown)$
+windowrule = center, match:class:^(org\.omarchy\.omadown)$
+CONF
+    if ! grep -q 'omadown.conf' "$HYPR_DIR/hyprland.conf"; then
+      printf '\n# omadown: keybindings and window rules\nsource = %s\n' "$CFG_DIR/omadown.conf" \
+        >> "$HYPR_DIR/hyprland.conf"
+      log "已追加 source 行到 $HYPR_DIR/hyprland.conf"
+    fi
+
+  elif [ -f "$HYPR_DIR/hyprland.lua" ]; then
+    # (A)/(B) Lua config: install the Lua module and require it.
+    install -Dm644 "$SRC_DIR/integrations/omarchy/omadown.lua" "$HYPR_DIR/omadown.lua"
+    log "已安装 Lua 模块 $HYPR_DIR/omadown.lua"
+
+    # Does this config set up ~/.config/?.lua on package.path (Omarchy's
+    # bootstrap.lua does)? If yes, `require("hypr.omadown")` resolves. If not,
+    # fall back to dofile with an absolute path.
+    hypr_remove_loader_line
+    if grep -q 'package\.path' "$HYPR_DIR/hyprland.lua" 2>/dev/null \
+       || grep -q 'bootstrap\.lua' "$HYPR_DIR/hyprland.lua" 2>/dev/null; then
+      loader='-- omadown: keybindings and window rules
+require("hypr.omadown")'
+    else
+      loader="-- omadown: keybindings and window rules
+dofile(os.getenv(\"HOME\") .. \"/.config/hypr/omadown.lua\")"
+    fi
+    printf '\n%s\n' "$loader" >> "$HYPR_DIR/hyprland.lua"
+    log "已在 $HYPR_DIR/hyprland.lua 追加 omadown 加载行"
+
+    # Remove any block an older install asked the user to paste by hand: the
+    # module owns the bindings now, and duplicates are confusing.
+    if grep -q 'omadown' "$HYPR_DIR/bindings.lua" 2>/dev/null; then
+      warn "从 $HYPR_DIR/bindings.lua 移除手工粘贴的 omadown 绑定（改由 omadown.lua 提供）"
+      hypr_remove_pasted_block
+    fi
+  else
+    warn "未找到 $HYPR_DIR/hyprland.conf 或 hyprland.lua，跳过键位绑定"
+    warn "请手动把 integrations/omarchy/omadown.lua 接进你的 Hyprland 配置"
+  fi
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
+fi
+
+# ------------------------------------------------------------------------ config
+if [ ! -f "$CFG_DIR/config.toml" ]; then
+  log "写入默认配置 $CFG_DIR/config.toml"
+  mkdir -p "$CFG_DIR"
+  PYTHONPATH="$LIB_DIR" python3 -c 'from omadown.config import Config; Config().save()'
+else
+  log "保留已有配置 $CFG_DIR/config.toml"
+fi
+
+# ---------------------------------------------------------------------- sanity
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) warn "$BIN_DIR 不在 PATH 中，请加入 shell 配置" ;;
+esac
+
+log "自检"
+PYTHONPATH="$LIB_DIR" python3 -m omadown doctor || true
+
+# Verify the keybindings actually registered, and say so -- a binding that fails
+# to register is the exact bug this file exists to prevent.
+if command -v hyprctl >/dev/null 2>&1; then
+  log "校验键位是否生效"
+  if hyprctl -j binds 2>/dev/null | grep -q 'omadown'; then
+    log "键位已注册（Super+D 等）"
+  else
+    warn "键位未注册。若 Hyprland 尚未重载配置，请执行: hyprctl reload"
+  fi
+fi
+
+cat <<EOF
+
+完成。
+
+  下一步
+    systemctl --user enable --now omadown.service     # 常驻队列 + 剪贴板监听
+    omadown add 'https://...' -f                      # 试跑一个
+    Super + D                                         # 打开队列界面
+    Super + Shift + D                                 # 下载剪贴板里的链接
+
+  Waybar 模块配置片段已复制到 $CFG_DIR/waybar-module.jsonc
+  Hyprland 键位与窗口规则: $HYPR_DIR/omadown.lua
+EOF

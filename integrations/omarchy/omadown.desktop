@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=omadown
+GenericName=Queue Downloader
+Comment=Downie 风格的队列下载器（Omarchy）
+Comment[en]=Downie-style queue downloader
+Exec=omadown tui
+Icon=folder-download
+Terminal=true
+StartupNotify=false
+Categories=AudioVideo;Network;FileTransfer;
+Keywords=download;video;audio;hls;m3u8;youtube;
