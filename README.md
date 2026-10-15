@@ -62,8 +62,11 @@ Hyprland 配置已改为 Lua（`hyprland.lua` + `require("hypr.*")`），那个�
 ```bash
 ./install.sh --no-deps      # 依赖自己装
 ./install.sh --no-integrations
-./install.sh --uninstall
+./install.sh --status       # 检测是否已安装并报告安装详情（已安装退出码 0）
+./install.sh --uninstall    # 卸载（保留配置与下载记录）
 ```
+
+**重复执行 `./install.sh` 即为更新**：脚本会检测已安装的版本并与源码对比，更新前停止守护进程、完成后自动恢复，按安装清单（`~/.local/share/omadown/install-manifest.txt`）清理新版本不再提供的旧文件；`config.toml`、下载队列与历史记录（`omadown.db`）原样保留。
 
 Omarchy 集成装到 `~/.config/hypr/omadown.lua`（键位与窗口规则）与
 `~/.config/omarchy/extensions/omadown-menu.sh`（菜单钩子），**不会覆盖 Omarchy 自带的默认文件**。

@@ -1,6 +1,6 @@
 [Unit]
 Description=omadown download queue daemon (queue, clipboard watch, control socket)
-Documentation=file:%h/.local/share/omadown/lib/omadown/README.md
+Documentation=file:%h/.local/share/omadown/README.md
 PartOf=graphical-session.target
 After=graphical-session.target
 ConditionEnvironment=WAYLAND_DISPLAY
